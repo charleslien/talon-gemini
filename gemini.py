@@ -1,265 +1,285 @@
-import io
-import tempfile
+import base64
+import requests
+import os
+from talon import Module, actions, app, screen
+from PIL import Image, ImageDraw, ImageFont
 
-import google.generativeai as genai
-from google.generativeai.types import content_types
-
-from talon import Context, Module, actions, app, clip, screen
-
-GEMINI_MODEL = 'gemini-1.5-flash'
 mod = Module()
-with open('gemini_api_key', 'r') as f:
-    gemini_api_key = f.read()
-genai.configure(api_key=gemini_api_key.strip())
 
+# Configure Gemini API
+with open('gemini_api_key', 'r') as f:
+    API_KEY = f.read().strip()
+
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp-01-21:generateContent"
+
+# Main prompt for the Gemini API
+GEMINI_PROMPT = """
+You are a highly precise computer vision assistant. Your task is to identify a UI element based on user voice command and output the exact pixel coordinates to complete the following command:
+"{phrase}"
+
+Think step by step: multiple short thoughts allowed per section.
+Use extremely concise language. Each thought max 5-7 words.
+
+Section 1 - Command Interpretation:
+Background:
+- The text given comes from speech-to-text software, which may parse the audio incorrectly
+- The text may even be not meant for you. (For example, overhearing background noises) In this case, there is nothing for you to do. Just output "None"
+Output:
+- Fix any speech recognition errors
+- If you believe the message is not a command meant for you, output "None" and end the output. In this case, there is no need to produce sections 2 and 3
+- Identify which specific UI element the user wants to click
+- What is the approximate location of this with respect to other UI elements?
+- Add more thoughts if needed
+
+Section 2 - Grid Analysis:
+Image has a coordinate grid:
+- Each red square is 50x50 pixels
+- Grid boxes are labeled
+- Grey lines every 25 pixels between main colored lines
+  - Top of box is y=0
+  - Bottom of box is y=50
+  - Left edge is x=0
+  - Right edge is x=50
+Output:
+- Restate the last line of Section 1 word for word
+- Note the ID of the bounding box containing the UI element
+- Use grey lines to determine the quadrant
+- If needed, refine even further for precise position (more specific than 25 pixels)
+- Calculate center point of target element
+- The final coordinates should be **within** the box (between 0 and 50)
+
+Section 3 - Final Output:
+Output:
+- [The box label]
+- [The calculated coordinates]
+
+Rules:
+- Final output format of Section 3 must be exactly: "ID\\nx,y"
+- The second to last line contains ONLY the box ID. No explanation or other text.
+- The final line contains ONLY the coordinates. No labels, no explanation.
+""".strip()
+
+GREY = '#808080'
+RED = '#FF0000'  # Color for all grid lines
+
+def to_base26(num, upper_case=False):
+    """Convert a number to base 26 using letters.
+    
+    Args:
+        num: Number to convert
+        upper_case: If True, use uppercase A-Z. If False, use lowercase a-z.
+    """
+    if num < 0:
+        return None
+    
+    if num == 0:
+        return 'A' if upper_case else 'a'
+        
+    base = ord('A') if upper_case else ord('a')
+        
+    digits = []
+    while num > 0:
+        remainder = num % 26
+        digits.append(chr(base + remainder))
+        num //= 26
+    
+    return ''.join(reversed(digits))
+
+def coords_to_id(coords):
+    """Convert (x, y) coordinates to a box ID string.
+    
+    Args:
+        coords: Tuple of (x, y) coordinates
+        
+    Returns:
+        String ID in format 'xyY' where x is lowercase a-z (can be multiple letters)
+        and Y is uppercase A-Z
+    """
+    if not isinstance(coords, (tuple, list)) or len(coords) != 2:
+        return None
+        
+    x, y = coords
+    if x < 0 or y < 0:
+        return None
+        
+    return f"{to_base26(x)}{to_base26(y, upper_case=True)}"
+
+def id_to_coords(box_id):
+    """Convert a box ID string to (x, y) coordinates.
+    
+    Args:
+        box_id: String ID in format 'xyY' where x is base 26 lowercase a-z (can be multiple letters)
+        and Y is base 26 uppercase A-Z
+        
+    Returns:
+        Tuple of (x, y) coordinates or None if invalid
+    """
+    if len(box_id) < 2:
+        return None
+        
+    x = 0
+    y = 0
+    for c in box_id:
+      if c.islower():
+        x = x * 26 + (ord(c) - ord('a'))
+      else:
+        y = y * 26 + (ord(c) - ord('A'))
+    
+    return (x, y)
+
+def draw_grid(image_path):
+    """Draw a 50px grid with labels on the image."""
+    # Open image
+    img = Image.open(image_path)
+    draw = ImageDraw.Draw(img)
+    
+    # Get dimensions
+    width, height = img.size
+    
+    # Draw grey lines first (every 25px, excluding 50px positions)
+    for x in range(25, width, 25):
+        if x % 50 != 0:  # Skip positions where main grid lines will be
+            draw.line([(x, 0), (x, height)], fill=GREY, width=1)
+    for y in range(25, height, 25):
+        if y % 50 != 0:  # Skip positions where main grid lines will be
+            draw.line([(0, y), (width, y)], fill=GREY, width=1)
+    
+    # Draw vertical colored lines
+    for x in range(0, width, 50):
+        draw.line([(x, 0), (x, height)], fill=RED, width=1)
+    
+    # Draw horizontal colored lines
+    for y in range(0, height, 50):
+        draw.line([(0, y), (width, y)], fill=RED, width=1)
+    
+    # Add coordinates at lattice points with larger font size
+    try:
+        # Try to load a system font with larger size
+        font = ImageFont.truetype("arial.ttf", 17)
+    except:
+        # Fallback to default font if custom font fails
+        font = ImageFont.load_default()
+    
+    for x in range(0, width, 50):
+        for y in range(0, height, 50):
+            # Create the coordinate text using coords_to_id
+            text = coords_to_id((x//50, y//50))
+            # Get text dimensions
+            text_bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            # Calculate centered position
+            text_x = x + 25 - text_width/2
+            text_y = y + 25 - text_height/2
+            # Draw centered text
+            draw.text((text_x, text_y), text, fill=RED, font=font)
+    
+    # Save the modified image
+    img.save(image_path)
 
 @mod.capture(rule="({user.vocabulary} | <phrase>)+")
 def phrase(m) -> str:
-    return apply_formatting(m)
+    """Capture a phrase."""
+    return str(m)
 
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def ensure_temp_dir():
+    """Ensure temporary directory exists."""
+    temp_dir = os.path.join(os.path.dirname(__file__), 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+def capture_and_process_screenshot():
+    """Capture screen, add grid, and return encoded image data."""
+    screenshot = screen.capture_rect(screen.main_screen().rect)
+    temp_dir = ensure_temp_dir()
+    temp_file = os.path.join(temp_dir, 'temp_screenshot.png')
+    screenshot.write_file(temp_file)
+    draw_grid(temp_file)
+    return encode_image(temp_file)
+
+def prepare_api_request(phrase: str, image_data: str):
+    """Prepare the API request payload."""
+    return {
+        "contents": [{
+            "parts": [
+                {"text": GEMINI_PROMPT.format(phrase=phrase)},
+                {
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": image_data
+                    }
+                }
+            ]
+        }]
+    }
+
+def handle_api_response(response_json):
+    """Extract coordinates from API response."""
+    if 'candidates' not in response_json or not response_json['candidates']:
+        raise ValueError("No response from Gemini")
+    
+    text = response_json['candidates'][0]['content']['parts'][0]['text'].strip()
+    print(GEMINI_PROMPT)
+    print(f"Received Gemini response:\n```\n{text}\n```")
+    lines = text.split('\n')
+    return lines[-2].strip(), lines[-1].strip()
+
+def process_coordinates(box_id: str, coordinates: str):
+    """Process coordinate string into mouse movement and click."""
+    print(f'{box_id=}')
+    # Convert box_id to coordinates
+    box_coords = id_to_coords(box_id)
+    print(box_coords)
+    if box_coords is None:
+        raise ValueError("Invalid box ID format")
+    
+    box_x, box_y = box_coords
+    x, y = map(float, coordinates.split(','))
+    
+    actions.mouse_move(box_x * 50 + x, box_y * 50 + y)
+    actions.mouse_click(0)  # 0 = left click
 
 @mod.action_class
 class Actions:
-
-    def process_phrase(phrase: str):
-        """Processes the captured phrase."""
-        screenshot = screen.capture_rect(screen.main_screen().rect)
-        clip.set_image(screenshot)
-
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.png') as f:
-            screenshot.write_file(f.name)
-            uploaded = genai.upload_file(f.name)
-        history.append(
-            content_types.to_content({
-                'parts':
-                [f'Speech-to-text: {phrase}\n', 'Current screen:', uploaded],
-                'role':
-                'user'
-            }))
-        response = model.generate_content(history)
-        history.append(response.candidates[0].content)
-        for part in response.candidates[0].content.parts:
-            if 'function_call' in part:
-                fn_name = part.function_call.name
-                named_args = part.function_call.args
-                tools_by_name[fn_name](**named_args)
-            if 'text' in part:
-                app.notify(body=part.text, title='Gemini')
-
-
-_TYPE_ID = {str: 1, float: 2, int: 3, bool: 4, list: 5, dict: 6}
-llm_tools = []
-tools_by_name = {}
-
-
-def get_function_declaration_proto(fn,
-                                   params) -> genai.protos.FunctionDeclaration:
-    return genai.protos.FunctionDeclaration(
-        name=fn.__name__,
-        description=fn.__doc__,
-        parameters=genai.protos.Schema(**params))
-
-
-def register(params):
-
-    def decorator(fn):
-        llm_tools.append(get_function_declaration_proto(fn, params))
-        tools_by_name[fn.__name__] = fn
-        return fn
-
-    return decorator
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'x': {
-                'type_': _TYPE_ID[float]
-            },
-            'y': {
-                'type_': _TYPE_ID[float]
+    def process_magic_command(phrase: str):
+        """Process a magic command phrase."""
+        temp_file = os.path.join(ensure_temp_dir(), 'temp_screenshot.png')
+        try:
+            # Capture and process screenshot
+            image_data = capture_and_process_screenshot()
+            print('asdf')
+            
+            # Prepare and send API request
+            payload = prepare_api_request(phrase, image_data)
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": API_KEY
             }
-        },
-        'required': ('x', 'y')
-    })
-def mouse_move(x: float, y: float) -> None:
-    '''Moves the mouse to the given coordinates.
-
-    (x=0, y=0) is the top left corner of the screen.
-
-    If the size of the screen is 1920x1200:
-        (x=810, y=600): approximately the middle of the screen
-        (x=810, y=0): the center top of the screen
-        (x=1920, y=1200): the bottom right corner of the screen
-
-    If coordinates given are negative or bigger than the size of the screen, they will be clamped to 0 and the size of the screen. e.g. x=-100 will be converted to x=0.
-    '''
-    actions.mouse_move(x, y)
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'button': {
-                'type_': _TYPE_ID[str],
-                'enum': ['LEFT', 'RIGHT', 'MIDDLE']
-            },
-            'press_action': {
-                'type_': _TYPE_ID[str],
-                'enum': ['CLICK', 'HOLD', 'RELEASE']
-            }
-        },
-        'required': ('button', 'press_action')
-    })
-def mouse_button(button: str, press_action: str) -> None:
-    '''Presses the given mouse button without moving the mouse.'''
-    button_id = {'LEFT': 0, 'RIGHT': 1, 'MIDDLE': 2}[button]
-    press_action = {
-        'CLICK': actions.mouse_click,
-        'HOLD': actions.mouse_drag,
-        'RELEASE': actions.mouse_release
-    }
-    press_action(button_id)
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'y': {
-                'type_':
-                _TYPE_ID[float],
-                'description':
-                'Positive values scroll down, negative values scroll up. Scrolls that many pixels. If not provided, does not scroll vertically.'
-            },
-            'x': {
-                'type_':
-                _TYPE_ID[float],
-                'description':
-                'Positive values scroll right, negative values scroll left. Scrolls that many pixels. If not provided, does not scroll horizontally.'
-            },
-            'by_lines': {
-                'type_': _TYPE_ID[bool],
-                'description': 'Scroll lines instead of pixels.'
-            }
-        },
-    })
-def mouse_scroll(y: float = 0, x: float = 0, by_lines: bool = False):
-    '''Scroll using the mouse wheel.'''
-    mouse_scroll(y=y, x=x, by_lines=by_lines)
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'text': {
-                'type_': _TYPE_ID[str],
-            }
-        },
-        'required': ('text', )
-    })
-def text_insert(text: str) -> None:
-    '''Types the given text.'''
-    actions.insert(text)
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'keys': {
-                'type_': _TYPE_ID[str],
-            },
-            'platform': {
-                'type_': _TYPE_ID[str],
-                'enum': [app.platform],
-            }
-        },
-        'required': ('keys', 'platform')
-    })
-def key_press(keys: str, platform: str) -> None:
-    '''Press one or more keys by name, space-separated.
-
-    Available keys:
-        a z 0 9 - + ( ) etc.
-        alt super ctrl shift cmd
-        left right up down
-        backspace bksp
-        delete del
-        escape esc
-        pgup pageup pgdown pagedown
-        return enter
-        tab space
-        home end
-        ralt rctrl rshift
-        capslock scroll_lock insert
-        f1 f2 ... f35
-        mute voldown volup play stop play_pause prev next rewind fast_forward
-        menu help sysreq printscr compose
-        brightness_up brightness_down
-        backlight_up backlight_down backlight_toggle
-        keypad_0 keypad_1 ... keypad_9
-        keypad_clear keypad_enter keypad_separator keypad_decimal keypad_plus
-        keypad_multiply keypad_divide keypad_minus keypad_equals
-
-    Keys can be held down with key:down and released with key:up
-    Example: key_press("shift:down", ...) or key_press("shift:up", ...)
-
-    Modification keys can be added attached with dashes (`-`).
-    Example:
-        key_press("cmd-q", "mac"): quits the current application.
-        keypress("super", "linux"): opens the Activities Overview or Application Launcher.
-        key_press("ctrl-shift-t", "windows"): reopens last tab on most browsers.
-    '''
-    actions.key(keys)
-
-
-@register(
-    params={
-        'type_': _TYPE_ID[dict],
-        'properties': {
-            'duration': {
-                'type_': _TYPE_ID[float],
-            }
-        },
-        'required': ('duration', )
-    })
-def sleep_seconds(duration: float) -> None:
-    '''Waits for the given amount of time (in seconds).'''
-    actions.sleep(duration)
-
-
-model = genai.GenerativeModel(GEMINI_MODEL, tools=llm_tools)
-history = content_types.to_contents([
-    {
-        'parts': [
-            'Hello, my name is Gemini, your personal voice-powered assistant!\n',
-            'How can I help you today?'
-        ],
-        'role':
-        'model',
-    },
-    {
-        'parts': [
-            "Hi Gemini, I'll be using speech-to-text engine to communicate with you as part of an accessibility app.\n",
-            'You will have access to a screenshot of my screen, and I may refer to UI elements currently on the screen.\n',
-            'You can control my computer, using mouse movements and keyboard inputs to complete the task I give you, much like a normal person would use a computer.\n',
-            "The software I'm using might cut me off early, so if you think I have not given you a complete command, please wait until I finish my command.\n",
-            "The software I'm using also might pick up a lot of background noise, so if you think the text given to you is not for you, feel free to ignore it.\n",
-            'For each phrase I give you, you will be able to call at most 10 functions.\n',
-            f'The platform I am using is **{app.platform}**.\n'
-        ],
-        'role':
-        'user',
-    },
-    {
-        'parts': [
-            'Okay, got it! I will try my best to interpret your intent with the informatino given to me and control your mouse and keyboard to execute the commands!'
-        ],
-        'role':
-        'model',
-    },
-])
+            
+            print(f'Received "magic" command: {phrase}')
+            
+            try:
+                response = requests.post(API_URL, headers=headers, json=payload)
+                response.raise_for_status()
+                
+                # Handle response
+                box_id, coordinates = handle_api_response(response.json())
+                
+                try:
+                    process_coordinates(box_id, coordinates)
+                except ValueError:
+                    app.notify(body=f"Invalid coordinates format", title='Gemini')
+                    
+            except requests.exceptions.RequestException as e:
+                app.notify(body=f"API Error: {str(e)}", title='Gemini')
+            except ValueError as e:
+                app.notify(body=str(e), title='Gemini')
+                
+        except Exception as e:
+            app.notify(body=f"Screenshot Error: {str(e)}", title='Gemini')
+            if os.path.exists(temp_file):
+                os.remove(temp_file)

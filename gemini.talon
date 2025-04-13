@@ -1,3 +1,1 @@
-^screenshot$: user.screenshot_to_clipboard()
-^<phrase>$: user.process_phrase("{phrase}")
-
+^magic <phrase>$: user.process_magic_command("{phrase}")
